@@ -157,7 +157,12 @@ def _channel_text(df: pd.DataFrame, channel: str) -> List[str]:
     """Normalized text for one channel. Address normalization is
     country-aware (French 'St' is 'Saint', not 'Street')."""
     if channel == "name":
-        return [normalize_name(n) for n in df["business_name"].tolist()]
+        # country matters here: normalize_name expands French "St" to
+        # "Saint" only when told the record is French. France is 15% of the
+        # test set and absent from training, so dropping this silently
+        # degrades exactly the partition we can least afford to get wrong.
+        return [normalize_name(n, c) for n, c in
+                zip(df["business_name"].tolist(), df["country"].tolist())]
     if channel == "address":
         return [
             normalize_address(a, c)
@@ -165,7 +170,8 @@ def _channel_text(df: pd.DataFrame, channel: str) -> List[str]:
                             df["country"].tolist())
         ]
     if channel == "combo":
-        names = [normalize_name(n) for n in df["business_name"].tolist()]
+        names = [normalize_name(n, c) for n, c in
+                 zip(df["business_name"].tolist(), df["country"].tolist())]
         addrs = [
             normalize_address(a, c)
             for a, c in zip(df["business_address"].tolist(),
