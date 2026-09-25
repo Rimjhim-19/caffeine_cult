@@ -66,7 +66,8 @@ def _prepare_channel_texts(df: pd.DataFrame) -> Dict[str, List[str]]:
     Assumes df has business_name, business_address, country columns.
     """
     names = [
-        normalize_name(n) for n in df["business_name"].tolist()
+        normalize_name(n, c)
+        for n, c in zip(df["business_name"].tolist(), df["country"].tolist())
     ]
     addrs = [
         normalize_address(a, c)
@@ -203,14 +204,24 @@ def generate_all_candidates(
 
     This is the top-level function train.py / infer.py should call.
     """
+    # Partition using a local canonical key, not raw display values. This
+    # stays open-set: any country label can match any equivalent stripped,
+    # case-insensitive label (e.g. "india", "India ", "INDIA").
+    def country_key(value: object) -> str:
+        return str(value).strip().casefold()
+
+    s1_country_key = s1_df["country"].map(country_key)
+    s2_country_key = s2_df["country"].map(country_key)
+    s3_country_key = s3_df["country"].map(country_key)
+
     all_candidates: Dict[str, List[str]] = {sid: [] for sid in s1_df["entity_id"]}
     all_channel_scores: Dict[Tuple[str, str], Dict[str, float]] = {}
 
-    countries = s1_df["country"].unique().tolist()
+    countries = s1_country_key.unique().tolist()
     for country in countries:
-        s1_part = s1_df[s1_df["country"] == country].reset_index(drop=True)
-        s2_part = s2_df[s2_df["country"] == country].reset_index(drop=True)
-        s3_part = s3_df[s3_df["country"] == country].reset_index(drop=True)
+        s1_part = s1_df[s1_country_key == country].reset_index(drop=True)
+        s2_part = s2_df[s2_country_key == country].reset_index(drop=True)
+        s3_part = s3_df[s3_country_key == country].reset_index(drop=True)
 
         cand_s2, scores_s2 = generate_candidates_for_country(
             s1_part, s2_part, top_k=top_k, row_batch_size=row_batch_size)
