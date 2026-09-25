@@ -88,6 +88,11 @@ _ADDR_ABBREV_MAP_ENGLISH_ONLY = {
     r"\bno\b": "number",
 }
 
+# In French, the abbreviation "St" means "Saint", not "Street".  Keep
+# the word-boundary token rule separate from the English address expansion so
+# the two country-specific meanings cannot leak into one another.
+_FRANCE_ST_PATTERN = re.compile(r"\bst\.? (?=\W|$)", flags=re.IGNORECASE | re.VERBOSE)
+
 _PUNCT_PATTERN = re.compile(r"[^\w\s]", flags=re.UNICODE)
 _WS_PATTERN = re.compile(r"\s+")
 
@@ -98,13 +103,14 @@ def _strip_accents(text: str) -> str:
     return "".join(ch for ch in nfkd if not unicodedata.combining(ch))
 
 
-def normalize_name(name: str) -> str:
+def normalize_name(name: str, country: str = "") -> str:
     """
     Normalize a business_name for comparison:
       1. lowercase + accent-fold
       2. '&' -> 'and'
-      3. strip punctuation
-      4. strip a trailing legal suffix (end-anchored only -- see module
+      3. for France only, expand standalone "St" / "St." to "Saint"
+      4. strip punctuation
+      5. strip a trailing legal suffix (end-anchored only -- see module
          docstring; this must run AFTER punctuation stripping so "Pvt.
          Ltd." and "Pvt Ltd" normalize identically)
       5. collapse whitespace
@@ -113,6 +119,8 @@ def normalize_name(name: str) -> str:
         return ""
     text = _strip_accents(name).lower()
     text = text.replace("&", " and ")
+    if country.strip().lower() == "france":
+        text = _FRANCE_ST_PATTERN.sub("saint", text)
     text = _PUNCT_PATTERN.sub(" ", text)
     text = _WS_PATTERN.sub(" ", text).strip()
     text = _SUFFIX_PATTERN.sub("", text).strip()
@@ -143,13 +151,21 @@ def normalize_address(address: str, country: str = "") -> str:
         text = re.sub(pattern, repl, text)
 
     is_france = country.strip().lower() == "france"
-    if not is_france:
+    if is_france:
+        text = _FRANCE_ST_PATTERN.sub("saint", text)
+    else:
         for pattern, repl in _ADDR_ABBREV_MAP_ENGLISH_ONLY.items():
             text = re.sub(pattern, repl, text)
 
     text = _PUNCT_PATTERN.sub(" ", text)
     text = _WS_PATTERN.sub(" ", text).strip()
     return text
+
+
+# Unit-style examples: country-specific meanings stay independent.
+# normalize_address("12 Rue St-Honoré", "France") == "12 rue saint honore"
+# normalize_address("12 Rue Saint-Honoré", "France") == "12 rue saint honore"
+# normalize_address("12 St Main", "US") == "12 street main"
 
 
 def extract_postal_code(address: str, country: str = "") -> str:

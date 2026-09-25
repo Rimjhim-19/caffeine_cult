@@ -72,7 +72,8 @@ def compute_pair_features(
     since both are country-aware (France's "St" ambiguity, India's absent
     postal codes -- see normalize.py).
     """
-    n1, n2 = normalize_name(s1_name), normalize_name(other_name)
+    n1 = normalize_name(s1_name, s1_country)
+    n2 = normalize_name(other_name, other_country)
     a1 = normalize_address(s1_address, s1_country)
     a2 = normalize_address(other_address, other_country)
 
