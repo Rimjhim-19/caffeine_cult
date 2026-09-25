@@ -222,7 +222,9 @@ def main():
 
     train_candidates, train_channel_scores = generate_all_candidates(
         s1_train, s2, s3, top_k=args.top_k, row_batch_size=args.row_batch_size)
-    recall_ceiling = measure_recall_ceiling(train_candidates, gt)
+    train_ids = set(s1_train["entity_id"])
+    gt_train_only = {k: v for k, v in gt.items() if k in train_ids}
+    recall_ceiling = measure_recall_ceiling(train_candidates, gt_train_only)
     print(f"[blocking] train recall ceiling: {recall_ceiling:.4f} "
           f"(EDA expects ~0.97-1.00 at this top_k with country partitioning "
           f"+ union channels; if far below that, raise --top-k first)")
