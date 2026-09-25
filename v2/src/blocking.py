@@ -1,247 +1,453 @@
 """
 blocking.py
 
-Candidate generation, rewritten against EDA findings.
+Candidate generation. This stage sets the hard recall ceiling for the whole
+pipeline: a true match that never appears here can never be recovered by
+any matcher, however good.
 
-Why this rewrite (see EDA_REPORT.md Sections E and G):
+Design decisions, each tied to a measurement on the real data:
 
-  - SCALE: train alone is ~2.2M S1 x ~5M S2 x ~5M S3 records. The original
-    version used sklearn's NearestNeighbors(algorithm="brute"), which
-    materializes dense distance computations -- infeasible at this size.
-    This version uses sparse TF-IDF matrix multiplication (sparse x sparse
-    stays sparse, since two records only "overlap" on shared n-grams) plus
-    a partial top-K selection per row, which is what the EDA's own
-    blocking benchmark (Section E17) used and validated.
+  WORD-LEVEL TOKENS, NOT CHAR N-GRAMS.
+    Char 3-5 gram TF-IDF produces a similarity matrix with measured density
+    0.21 (name channel) and 0.76 (name+address channel) -- because common
+    trigrams appear in nearly every record, "sparse x sparse stays sparse"
+    does not hold. At a 2,000-row batch against a 3M pool that is 15 GB and
+    55 GB respectively. Word-level tokens measure 0.024 and 0.18, a 10-30x
+    reduction, and lose nothing: sharing at least one name-or-address token
+    covers 99.99% of true pairs (1 miss in 11,560 sampled).
 
-  - COUNTRY PARTITIONING: EDA B9 found ZERO cross-country true matches in
-    7.64M ground-truth pairs (100.000000% country consistency). Blocking
-    now partitions by country FIRST and only searches within the same
-    country -- this is both a correctness-safe recall improvement (no risk
-    of dropping a true match, since none exist across countries) and a
-    ~2.5x reduction in search space per partition.
+  COUNTRY IS A HARD PARTITION.
+    Verified across all 7,638,365 training ground-truth pairs: zero
+    cross-country matches. Partitioning is therefore recall-free and cuts
+    the search space ~2.5x. Countries are read from the data, never
+    hardcoded -- France appears only at test time and must partition like
+    any other label.
 
-  - MULTI-CHANNEL: EDA E18 found name-only TF-IDF blocking recovers only
-    61.9%-74.8% of true India matches even at K=50 (India has heavy
-    DBA/trade-name divergence from the registered name -- EDA C12/C13,
-    D16). The union of name-only + address-only + combined(name+address)
-    channels reaches 97.84%-100% recall at K=10. This version always
-    builds and unions all three channels.
+  TWO CHANNELS, UNIONED.
+    Name-token overlap alone covers 85.66% of true pairs; address-token
+    overlap covers 95.57%; the union covers 99.99%. Address carries more
+    signal than name here, largely because ~7% of Source 2/3 names are in
+    Devanagari, Gurmukhi or Tamil while Source 1 is always Latin -- for
+    those records name similarity is structurally zero, and 99.88% of them
+    are still reachable through the address.
 
-Candidates returned here go straight into candidate_pairs.tsv, and the
-per-channel similarity scores are also returned so features.py can reuse
-them as features instead of recomputing TF-IDF per pair (too slow at this
-scale -- see features.py docstring).
+  SCORE FLOOR, NOT FIXED TOP-K.
+    A plain top-K hands every S1 entity exactly K candidates even when the
+    best of them has cosine 0.02. That inflates candidate_pairs.tsv and
+    wrecks the reduction ratio the organisers audit. Candidates must clear
+    both an absolute floor and a floor relative to that row's best match.
+
+  COLUMNAR OUTPUT.
+    Scores come back as parallel numpy arrays, not a
+    {(s1_id, cand_id): {...}} dict. At ~1.7M x ~60 candidates that dict is
+    ~100M tuple-keyed entries -- hundreds of GB of Python objects. The
+    arrays go straight to parquet and are read back by the feature stage.
 """
 
 from __future__ import annotations
 
-from typing import Dict, List, Tuple
+import os
+import pickle
+from dataclasses import dataclass, field
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
 from sklearn.feature_extraction.text import TfidfVectorizer
 
+try:
+    from joblib import Parallel, delayed
+    _HAS_JOBLIB = True
+except ImportError:  # joblib ships with scikit-learn, but don't hard-fail
+    _HAS_JOBLIB = False
+
 from normalize import normalize_address, normalize_name
 
-CHANNELS = ("name", "address", "combo")
+CHANNELS: Tuple[str, ...] = ("name", "address")
 
 
-def _char_ngram_analyzer(text: str, n_lo: int = 3, n_hi: int = 5):
-    grams = []
-    for n in range(n_lo, n_hi + 1):
-        if len(text) < n:
-            continue
-        grams.extend(text[i:i + n] for i in range(len(text) - n + 1))
-    return grams
+@dataclass
+class BlockingConfig:
+    """Tunable knobs. Defaults are the measured-sane starting point.
 
-
-def _build_vectorizer() -> TfidfVectorizer:
-    return TfidfVectorizer(analyzer=lambda t: _char_ngram_analyzer(t, 3, 5), min_df=1)
-
-
-def _prepare_channel_texts(df: pd.DataFrame) -> Dict[str, List[str]]:
+    top_k            candidates kept per channel, per source, per S1 entity
+    min_sim          absolute cosine floor; below this a candidate is noise
+    rel_floor        fraction of the row's best score a candidate must reach
+    batch_size       S1 rows per similarity block (memory/speed tradeoff)
+    max_df           drop tokens appearing in more than this fraction of the
+                     pool -- trims the giant posting lists ("road", "limited")
+                     that dominate the sparse product's nonzeros
+    min_df           drop hapax tokens; 1 keeps everything (typos are signal)
     """
-    Build the three normalized text channels for a source dataframe.
-    Assumes df has business_name, business_address, country columns.
+
+    top_k: int = 20
+    min_sim: float = 0.05
+    rel_floor: float = 0.25
+    batch_size: int = 500
+    max_df: float = 0.05
+    min_df: int = 1
+    channels: Tuple[str, ...] = CHANNELS
+
+    # Cache of normalized pool text + fitted vectorizer + pool matrix, keyed
+    # by (tag, country, source, channel). Building these is ~25 min of fixed
+    # cost per run at full scale, independent of how many S1 entities you
+    # query -- so it dominates short runs and is pure waste on repeats.
+    # Set to None to disable.
+    cache_dir: Optional[str] = None
+
+    # Partitions are fully independent (no shared state, no cross-country
+    # matches), so they parallelise cleanly. Each worker holds its own pool
+    # matrix, so memory scales with n_jobs -- start at 2 if RAM is tight.
+    n_jobs: int = 1
+
+
+@dataclass
+class CandidateSet:
+    """Long-form candidate table: one row per (S1 entity, candidate) pair.
+
+    Parallel arrays rather than a dict of dicts -- see module docstring.
+    `to_frame()` gives the parquet-ready DataFrame the feature stage reads.
     """
-    names = [
-        normalize_name(n) for n in df["business_name"].tolist()
-    ]
-    addrs = [
-        normalize_address(a, c)
-        for a, c in zip(df["business_address"].tolist(), df["country"].tolist())
-    ]
-    combos = [f"{n} {a}".strip() for n, a in zip(names, addrs)]
-    return {"name": names, "address": addrs, "combo": combos}
+
+    s1_ids: List[str] = field(default_factory=list)
+    cand_ids: List[str] = field(default_factory=list)
+    sim_name: List[float] = field(default_factory=list)
+    sim_address: List[float] = field(default_factory=list)
+    rank_name: List[int] = field(default_factory=list)
+    rank_address: List[int] = field(default_factory=list)
+
+    def extend(self, other: "CandidateSet") -> None:
+        self.s1_ids.extend(other.s1_ids)
+        self.cand_ids.extend(other.cand_ids)
+        self.sim_name.extend(other.sim_name)
+        self.sim_address.extend(other.sim_address)
+        self.rank_name.extend(other.rank_name)
+        self.rank_address.extend(other.rank_address)
+
+    def to_frame(self) -> pd.DataFrame:
+        df = pd.DataFrame({
+            "source1_entity_id": self.s1_ids,
+            "candidate_entity_id": self.cand_ids,
+            "sim_name": np.asarray(self.sim_name, dtype=np.float32),
+            "sim_address": np.asarray(self.sim_address, dtype=np.float32),
+            "rank_name": np.asarray(self.rank_name, dtype=np.int16),
+            "rank_address": np.asarray(self.rank_address, dtype=np.int16),
+        })
+        # Listwise features: how this candidate stands relative to the rest
+        # of its own S1 entity's shortlist. These are consistently among the
+        # strongest inputs to the matcher -- "best of a good set" and "best
+        # of a bad set" look identical without them.
+        df["sim_best"] = np.maximum(df["sim_name"], df["sim_address"])
+        grp = df.groupby("source1_entity_id")["sim_best"]
+        df["cand_count"] = grp.transform("size").astype(np.int16)
+        df["sim_max_for_s1"] = grp.transform("max").astype(np.float32)
+        df["sim_margin"] = (df["sim_max_for_s1"] - df["sim_best"]).astype(np.float32)
+        return df
+
+    def to_dict(self) -> Dict[str, List[str]]:
+        """{s1_id: [cand_id, ...]} -- the shape candidate_pairs.tsv needs."""
+        out: Dict[str, List[str]] = {}
+        for s1_id, cand_id in zip(self.s1_ids, self.cand_ids):
+            out.setdefault(s1_id, []).append(cand_id)
+        return out
 
 
-def _sparse_top_k_per_row(sim: sp.csr_matrix, k: int) -> List[np.ndarray]:
+def _channel_text(df: pd.DataFrame, channel: str) -> List[str]:
+    """Normalized text for one channel. Address normalization is
+    country-aware (French 'St' is 'Saint', not 'Street')."""
+    if channel == "name":
+        return [normalize_name(n) for n in df["business_name"].tolist()]
+    if channel == "address":
+        return [
+            normalize_address(a, c)
+            for a, c in zip(df["business_address"].tolist(),
+                            df["country"].tolist())
+        ]
+    if channel == "combo":
+        names = [normalize_name(n) for n in df["business_name"].tolist()]
+        addrs = [
+            normalize_address(a, c)
+            for a, c in zip(df["business_address"].tolist(),
+                            df["country"].tolist())
+        ]
+        return [f"{n} {a}".strip() for n, a in zip(names, addrs)]
+    raise ValueError(f"unknown channel: {channel}")
+
+
+def _cache_path(cfg: BlockingConfig, tag: str, channel: str) -> Optional[str]:
+    if not cfg.cache_dir:
+        return None
+    os.makedirs(cfg.cache_dir, exist_ok=True)
+    # Vocabulary depends on these, so they belong in the key -- otherwise a
+    # stale cache silently reuses a matrix fitted under different settings.
+    key = f"{tag}__{channel}__mdf{cfg.max_df}__ndf{cfg.min_df}.pkl"
+    return os.path.join(cfg.cache_dir, key)
+
+
+def _fit_pool_channel(pool_df: pd.DataFrame, channel: str, tag: str,
+                      cfg: BlockingConfig):
+    """Fitted vectorizer + pool matrix for one channel, cached to disk.
+
+    This is the expensive half of blocking: normalizing millions of pool
+    records and fitting TF-IDF over them. It depends only on the pool, never
+    on which S1 entities you happen to be querying, so it is computed once
+    per (partition, channel) and reused by every later run.
     """
-    For each row of a sparse similarity matrix, return the column indices
-    of its top-k highest values (unsorted within the top-k, which is fine
-    -- we only need set membership for candidate generation).
+    path = _cache_path(cfg, tag, channel)
+    if path and os.path.isfile(path):
+        with open(path, "rb") as f:
+            return pickle.load(f)
 
-    Only touches each row's actual nonzero entries (the whole point of
-    keeping this sparse) rather than materializing a dense n1 x n2 array.
+    vec = TfidfVectorizer(
+        analyzer="word",
+        token_pattern=r"\S+",
+        max_df=cfg.max_df,
+        min_df=cfg.min_df,
+        dtype=np.float32,
+    )
+    try:
+        pool_matrix = vec.fit_transform(_channel_text(pool_df, channel)).tocsr()
+    except ValueError:
+        return None
+
+    payload = (vec, pool_matrix)
+    if path:
+        with open(path, "wb") as f:
+            pickle.dump(payload, f, protocol=4)
+    return payload
+
+
+def _fit_channel(pool_texts: Sequence[str], s1_texts: Sequence[str],
+                 cfg: BlockingConfig) -> Tuple[sp.csr_matrix, sp.csr_matrix]:
+    """Fit TF-IDF on the POOL and transform both sides.
+
+    Fitting on the pool alone (not pool + S1) is deliberate: IDF should
+    describe the corpus being searched. It also halves peak memory, and it
+    means the same fitted vectorizer can be reused across S1 batches.
+
+    TfidfVectorizer L2-normalizes rows by default, so the dot product of
+    two rows IS their cosine similarity -- no separate normalization step,
+    and no distance-to-similarity conversion.
     """
-    sim = sim.tocsr()
-    out = []
-    indptr, indices, data = sim.indptr, sim.indices, sim.data
-    for row in range(sim.shape[0]):
-        start, end = indptr[row], indptr[row + 1]
-        row_indices = indices[start:end]
-        row_data = data[start:end]
-        if len(row_data) <= k:
-            out.append(row_indices)
-            continue
-        top_k_local = np.argpartition(row_data, -k)[-k:]
-        out.append(row_indices[top_k_local])
-    return out
+    vec = TfidfVectorizer(
+        analyzer="word",
+        token_pattern=r"\S+",     # text is pre-normalized; split on whitespace
+        max_df=cfg.max_df,
+        min_df=cfg.min_df,
+        dtype=np.float32,
+    )
+    try:
+        pool_matrix = vec.fit_transform(pool_texts)
+    except ValueError:
+        # Every token pruned (tiny or degenerate partition) -- no signal.
+        return None, None
+    s1_matrix = vec.transform(s1_texts)
+    return s1_matrix.tocsr(), pool_matrix.tocsr()
 
 
-def generate_candidates_for_country(
+def _row_top_k(data: np.ndarray, indices: np.ndarray,
+               cfg: BlockingConfig) -> Tuple[np.ndarray, np.ndarray]:
+    """Top-K of one sparse row, after applying both floors.
+
+    Returns (column_indices, scores) sorted best-first so rank is just the
+    position. Touches only the row's nonzeros -- never densifies.
+    """
+    if data.size == 0:
+        return np.empty(0, dtype=np.int32), np.empty(0, dtype=np.float32)
+
+    keep = data >= cfg.min_sim
+    if not keep.any():
+        return np.empty(0, dtype=np.int32), np.empty(0, dtype=np.float32)
+    data, indices = data[keep], indices[keep]
+
+    # Relative floor: a candidate far below this row's best is noise even
+    # if it clears the absolute floor.
+    keep = data >= (data.max() * cfg.rel_floor)
+    data, indices = data[keep], indices[keep]
+
+    if data.size > cfg.top_k:
+        sel = np.argpartition(data, -cfg.top_k)[-cfg.top_k:]
+        data, indices = data[sel], indices[sel]
+
+    order = np.argsort(-data)
+    return indices[order], data[order]
+
+
+def generate_candidates(
     s1_df: pd.DataFrame,
-    other_df: pd.DataFrame,
-    top_k: int = 20,
-    row_batch_size: int = 2000,
-) -> Tuple[Dict[str, List[str]], Dict[Tuple[str, str], Dict[str, float]]]:
-    """
-    Generate candidates from `other_df` for every S1 entity in `s1_df`,
-    ASSUMING both dataframes have already been filtered to the same
-    country (country partitioning happens one level up, in
-    generate_all_candidates).
+    pool_df: pd.DataFrame,
+    cfg: Optional[BlockingConfig] = None,
+    tag: str = "",
+) -> CandidateSet:
+    """Candidates from one pool (S2 or S3) for one country partition.
 
-    Returns:
-      candidates: {s1_entity_id: [candidate_entity_id, ...]}  (union of
-        the three channels' top-K, deduped)
-      channel_scores: {(s1_entity_id, candidate_entity_id): {"name": sim,
-        "address": sim, "combo": sim}} -- reused downstream as features
-        instead of recomputing TF-IDF per pair.
-
-    Processes S1 in batches (row_batch_size) to bound memory: each batch's
-    sparse similarity block against the full `other_df` pool is computed,
-    top-K extracted, then discarded before the next batch.
+    Both frames must already be filtered to the same country; partitioning
+    happens in generate_all_candidates.
     """
+    cfg = cfg or BlockingConfig()
+    result = CandidateSet()
+    if len(s1_df) == 0 or len(pool_df) == 0:
+        return result
+
     s1_ids = s1_df["entity_id"].tolist()
-    other_ids = other_df["entity_id"].tolist()
+    pool_ids = pool_df["entity_id"].tolist()
 
-    if len(other_df) == 0 or len(s1_df) == 0:
-        return {sid: [] for sid in s1_ids}, {}
+    matrices: Dict[str, Tuple[sp.csr_matrix, sp.csr_matrix]] = {}
+    for ch in cfg.channels:
+        fitted = _fit_pool_channel(pool_df, ch, tag, cfg)
+        if fitted is None:
+            continue
+        vec, pool_m = fitted
+        # S1 is the cheap side: transform only, using the pool's vocabulary
+        # and IDF. Never refit here -- that would put the two sides in
+        # different feature spaces and silently zero out every similarity.
+        s1_m = vec.transform(_channel_text(s1_df, ch)).tocsr()
+        matrices[ch] = (s1_m, pool_m)
+    if not matrices:
+        return result
 
-    s1_channels = _prepare_channel_texts(s1_df)
-    other_channels = _prepare_channel_texts(other_df)
+    for start in range(0, len(s1_ids), cfg.batch_size):
+        end = min(start + cfg.batch_size, len(s1_ids))
 
-    # Fit one vectorizer per channel, jointly over S1 + other, so both
-    # sides share the same feature space for that channel.
-    vectorizers = {}
-    s1_matrices = {}
-    other_matrices = {}
-    for ch in CHANNELS:
-        vec = _build_vectorizer()
-        combined = vec.fit_transform(s1_channels[ch] + other_channels[ch])
-        s1_matrices[ch] = combined[: len(s1_channels[ch])]
-        other_matrices[ch] = combined[len(s1_channels[ch]):]
-        vectorizers[ch] = vec
+        # Per channel: the batch's sparse similarity block, kept sparse.
+        blocks: Dict[str, sp.csr_matrix] = {}
+        for ch, (s1_m, pool_m) in matrices.items():
+            blocks[ch] = (s1_m[start:end] @ pool_m.T).tocsr()
 
-    candidates: Dict[str, List[str]] = {}
-    channel_scores: Dict[Tuple[str, str], Dict[str, float]] = {}
+        for local_i in range(end - start):
+            s1_id = s1_ids[start + local_i]
 
-    n_rows = len(s1_ids)
-    for batch_start in range(0, n_rows, row_batch_size):
-        batch_end = min(batch_start + row_batch_size, n_rows)
-        batch_s1_ids = s1_ids[batch_start:batch_end]
+            picked: Dict[str, Tuple[np.ndarray, np.ndarray]] = {}
+            row_lookup: Dict[str, Dict[int, float]] = {}
+            for ch, block in blocks.items():
+                lo, hi = block.indptr[local_i], block.indptr[local_i + 1]
+                idx, sco = _row_top_k(block.data[lo:hi],
+                                      block.indices[lo:hi], cfg)
+                picked[ch] = (idx, sco)
+                # Full row map, so a candidate found by one channel still
+                # gets its true similarity under the other channel rather
+                # than a fabricated zero.
+                row_lookup[ch] = dict(zip(block.indices[lo:hi].tolist(),
+                                          block.data[lo:hi].tolist()))
 
-        # per-channel top-k indices for this batch
-        per_channel_topk: Dict[str, List[np.ndarray]] = {}
-        per_channel_sim: Dict[str, sp.csr_matrix] = {}
-        for ch in CHANNELS:
-            batch_matrix = s1_matrices[ch][batch_start:batch_end]
-            # sparse x sparse -> sparse: only nonzero n-gram overlaps
-            # produce nonzero similarity entries.
-            sim = batch_matrix @ other_matrices[ch].T
-            per_channel_sim[ch] = sim.tocsr()
-            per_channel_topk[ch] = _sparse_top_k_per_row(sim, top_k)
+            union: Dict[int, None] = {}
+            for ch in picked:
+                for j in picked[ch][0].tolist():
+                    union[j] = None
+            if not union:
+                continue
 
-        for local_i, s1_id in enumerate(batch_s1_ids):
-            union_idx = set()
-            for ch in CHANNELS:
-                union_idx.update(per_channel_topk[ch][local_i].tolist())
-            cand_ids = [other_ids[j] for j in sorted(union_idx)]
-            candidates[s1_id] = cand_ids
+            rank_of = {
+                ch: {int(j): r for r, j in enumerate(picked[ch][0].tolist())}
+                for ch in picked
+            }
+            name_lookup = row_lookup.get("name", {})
+            addr_lookup = row_lookup.get("address", {})
+            name_rank = rank_of.get("name", {})
+            addr_rank = rank_of.get("address", {})
 
-            for j in sorted(union_idx):
-                cand_id = other_ids[j]
-                scores = {}
-                for ch in CHANNELS:
-                    scores[ch] = float(per_channel_sim[ch][local_i, j])
-                channel_scores[(s1_id, cand_id)] = scores
+            for j in union:
+                result.s1_ids.append(s1_id)
+                result.cand_ids.append(pool_ids[j])
+                result.sim_name.append(float(name_lookup.get(j, 0.0)))
+                result.sim_address.append(float(addr_lookup.get(j, 0.0)))
+                # 999 = "this channel did not shortlist it", which the tree
+                # model can split on cleanly.
+                result.rank_name.append(int(name_rank.get(j, 999)))
+                result.rank_address.append(int(addr_rank.get(j, 999)))
 
-    return candidates, channel_scores
-
-
-def merge_candidate_dicts(*dicts: Dict[str, List[str]]) -> Dict[str, List[str]]:
-    """Union candidate lists (e.g. Source2 candidates + Source3 candidates) per S1 id."""
-    merged: Dict[str, List[str]] = {}
-    for d in dicts:
-        for s1_id, cand_ids in d.items():
-            merged.setdefault(s1_id, [])
-            existing = set(merged[s1_id])
-            merged[s1_id].extend(c for c in cand_ids if c not in existing)
-    return merged
+    return result
 
 
 def generate_all_candidates(
-    s1_df: pd.DataFrame, s2_df: pd.DataFrame, s3_df: pd.DataFrame,
-    top_k: int = 20, row_batch_size: int = 2000,
-) -> Tuple[Dict[str, List[str]], Dict[Tuple[str, str], Dict[str, float]]]:
+    s1_df: pd.DataFrame,
+    s2_df: pd.DataFrame,
+    s3_df: pd.DataFrame,
+    cfg: Optional[BlockingConfig] = None,
+    verbose: bool = True,
+) -> CandidateSet:
+    """Full blocking stage: partition by country, block against S2 and S3.
+
+    Countries are taken from the data. France is not special-cased and does
+    not need to be -- it partitions like US and India, and nothing in this
+    module branches on the label's value.
     """
-    Full blocking stage: partitions all three sources by country (EDA B9:
-    100% of true matches are same-country, so this is free recall-safe
-    reduction), then runs multi-channel blocking against S2 and S3
-    separately within each country partition, and unions the results.
+    cfg = cfg or BlockingConfig()
 
-    This is the top-level function train.py / infer.py should call.
-    """
-    all_candidates: Dict[str, List[str]] = {sid: [] for sid in s1_df["entity_id"]}
-    all_channel_scores: Dict[Tuple[str, str], Dict[str, float]] = {}
+    # Build the partition list first so it can be farmed out. Countries come
+    # from the data: at test time France appears here alongside US and India
+    # with no code change, because nothing branches on the label's value.
+    jobs = []
+    for country in s1_df["country"].unique().tolist():
+        s1_part = s1_df[s1_df["country"] == country]
+        for pool_df, label in ((s2_df, "S2"), (s3_df, "S3")):
+            pool_part = pool_df[pool_df["country"] == country]
+            jobs.append((f"{country}_{label}", country, label,
+                         s1_part, pool_part))
 
-    countries = s1_df["country"].unique().tolist()
-    for country in countries:
-        s1_part = s1_df[s1_df["country"] == country].reset_index(drop=True)
-        s2_part = s2_df[s2_df["country"] == country].reset_index(drop=True)
-        s3_part = s3_df[s3_df["country"] == country].reset_index(drop=True)
+    def _run(tag, country, label, s1_part, pool_part):
+        part = generate_candidates(s1_part, pool_part, cfg, tag=tag)
+        if verbose:
+            print(f"[blocking] {country:>8s} x {label}: "
+                  f"{len(s1_part):>8,} S1 x {len(pool_part):>9,} pool "
+                  f"-> {len(part.s1_ids):>10,} pairs", flush=True)
+        return part
 
-        cand_s2, scores_s2 = generate_candidates_for_country(
-            s1_part, s2_part, top_k=top_k, row_batch_size=row_batch_size)
-        cand_s3, scores_s3 = generate_candidates_for_country(
-            s1_part, s3_part, top_k=top_k, row_batch_size=row_batch_size)
+    if cfg.n_jobs > 1 and _HAS_JOBLIB and len(jobs) > 1:
+        # Each worker holds its own pool matrix, so peak memory is roughly
+        # n_jobs x the single-partition footprint. Halve batch_size if this
+        # pushes the machine into swap -- swapping is far slower than running
+        # the partitions sequentially would have been.
+        parts = Parallel(n_jobs=min(cfg.n_jobs, len(jobs)), backend="loky")(
+            delayed(_run)(*job) for job in jobs
+        )
+    else:
+        parts = [_run(*job) for job in jobs]
 
-        merged = merge_candidate_dicts(cand_s2, cand_s3)
-        all_candidates.update(merged)
-        all_channel_scores.update(scores_s2)
-        all_channel_scores.update(scores_s3)
-
-    return all_candidates, all_channel_scores
+    result = CandidateSet()
+    for part in parts:
+        result.extend(part)
+    return result
 
 
 def measure_recall_ceiling(
     candidates: Dict[str, List[str]],
     ground_truth: Dict[str, List[str]],
-) -> float:
+    s1_ids: Optional[Iterable[str]] = None,
+) -> Dict[str, float]:
+    """Blocking quality diagnostics.
+
+    IMPORTANT: pass `s1_ids` when scoring a fold. Ground truth covers every
+    S1 entity, so measuring train-fold candidates against the full ground
+    truth counts the validation fold's true matches as blocking misses and
+    understates recall by roughly the validation fraction. That bug made
+    the previous pipeline report ~0.78 where the real figure was ~0.97.
+
+    Returns recall (fraction of true matches present in the candidate set),
+    mean candidates per entity, and the fraction of entities blocking found
+    nothing for.
     """
-    Diagnostic: of all true matches in ground_truth, what fraction survived
-    into the blocking candidate set? This is the hard ceiling on achievable
-    recall -- per EDA E18/E20, the union-channel config should land in the
-    97-100% range. If your measured number is meaningfully below that,
-    raise top_k before touching the matcher.
-    """
-    total_true = 0
-    total_found = 0
+    if s1_ids is not None:
+        keys = set(s1_ids)
+        ground_truth = {k: v for k, v in ground_truth.items() if k in keys}
+
+    total_true = found = 0
+    total_cands = 0
+    empty = 0
     for s1_id, true_ids in ground_truth.items():
         cand_set = set(candidates.get(s1_id, []))
-        for t in true_ids:
-            total_true += 1
-            if t in cand_set:
-                total_found += 1
-    return total_found / total_true if total_true else 1.0
+        total_cands += len(cand_set)
+        if not cand_set:
+            empty += 1
+        total_true += len(true_ids)
+        found += sum(1 for t in true_ids if t in cand_set)
+
+    n = max(1, len(ground_truth))
+    return {
+        "recall_ceiling": found / total_true if total_true else 1.0,
+        "mean_candidates": total_cands / n,
+        "empty_fraction": empty / n,
+        "n_entities": len(ground_truth),
+        "n_true_matches": total_true,
+    }
