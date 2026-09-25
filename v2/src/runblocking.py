@@ -60,6 +60,8 @@ def main() -> int:
     ap.add_argument("--batch-size", type=int, default=500,
                     help="S1 rows per similarity block. Lower this first if "
                          "you hit a MemoryError.")
+    ap.add_argument("--channels", default="name,address",
+                    help="comma-separated: name,address,combo")
     args = ap.parse_args()
 
     s = args.split
@@ -76,7 +78,7 @@ def main() -> int:
         print(f"[load] sampled down to {len(s1):,} S1 entities "
               f"(pool left at full size on purpose)")
 
-    cfg = BlockingConfig(
+        cfg = BlockingConfig(
         top_k=args.top_k,
         min_sim=args.min_sim,
         rel_floor=args.rel_floor,
@@ -84,6 +86,7 @@ def main() -> int:
         batch_size=args.batch_size,
         cache_dir=args.cache_dir,
         n_jobs=args.n_jobs,
+        channels=tuple(args.channels.split(",")),
     )
 
     t0 = time.time()
